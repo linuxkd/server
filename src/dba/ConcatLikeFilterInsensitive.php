@@ -3,11 +3,8 @@
 namespace Hashtopolis\dba;
 
 class ConcatLikeFilterInsensitive extends Filter {
-  private $value;
-  /**
-   * @var AbstractModelFactory
-   */
-  private $overrideFactory;
+  private mixed $value;
+  private AbstractModelFactory $overrideFactory;
 
   /**
    * @var ConcatColumn[] $columns
@@ -32,7 +29,7 @@ class ConcatLikeFilterInsensitive extends Filter {
     return "LOWER(" . "CONCAT(" . implode(", ", $mapped_columns) . ")" . ") LIKE LOWER(?)";
   }
   
-  function getValue() {
+  function getValue(): mixed {
     return $this->value;
   }
   
