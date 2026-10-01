@@ -440,7 +440,7 @@ class AgentUtils {
         Factory::getAssignmentFactory()->delete($assignments[$i]);
       }
       $assignment = $assignments[0];
-      $assignment = Factory::getAssignmentFactory()->mset($assignment, [Assignment::TASK_ID => $task->getId(), Assignment::BENCHMARK => $benchmark]);
+      $assignment = Factory::getAssignmentFactory()->mset($assignment, [Assignment::TASK_ID => $task->getId(), Assignment::BENCHMARK => $benchmark, Assignment::CHUNK_SPEED => null]);
     }
     else {
       $assignment = new Assignment(null, $task->getId(), $agent->getId(), $benchmark);
