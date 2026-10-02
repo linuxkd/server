@@ -18,59 +18,63 @@ use Hashtopolis\inc\SConfig;
 use Hashtopolis\inc\Util;
 
 class ChunkUtils {
-  const RECONCILE_ALPHA = 0.4;
-  const RECONCILE_MIN_SPEED = 1;
-  const RECONCILE_MAX_UP_RATIO = 4.0;
-  const RECONCILE_MIN_INTERVAL = 1;   // seconds; ignore sub-second / freshly-dispatched report intervals
+  // chunkSpeed is stored scaled by SPEED_SCALE (milli-base-words/second) so the EWMA accumulator keeps
+  // sub-unit precision; without scaling an integer accumulator cannot climb when a step is < 0.5/s
+  // (the observed "integer dead-zone" that froze slow-hash sizing at the seed).
+  const SPEED_SCALE = 1000;
+  const RECONCILE_ALPHA = 0.6;          // weight on the newest completed-chunk measurement
+  const RECONCILE_MAX_UP_RATIO = 4.0;   // bound a single upward jump against a freak fast chunk
+  const RECONCILE_MIN_DURATION = 5;     // seconds; ignore chunks too short to measure a stable rate
 
   /**
-   * Derive the observed BASE-WORD processing rate (base-words/s) of a running chunk from the keyspace-progress
-   * delta between two consecutive status reports. This is the unit-correct sizing signal: a chunk's length and
-   * a task's keyspace are measured in base words, whereas the raw hashcat hash-rate the agent reports is
-   * base-words/s x rule-count x salt-count. Feeding that raw rate into the sizer over-sizes rule/salt attacks
-   * by the multiplier; deriving the rate from the keyspace delta is correct and multiplier-agnostic (it never
-   * needs to know the rule or salt count).
+   * Observed BASE-WORD processing rate of a COMPLETED chunk, scaled by SPEED_SCALE.
    *
-   * Returns null when there is no usable interval to measure:
-   *  - $prevSolveTime <= 0 : the chunk was freshly (re)dispatched (createNewChunk / handleExistingChunk seed
-   *                          solveTime to 0), so this first interval is contaminated by multi-GPU autotune
-   *                          ramp-up -- skip it and let the EWMA absorb the bootstrap.
-   *  - $dT < MIN_INTERVAL  : both reports landed in the same wall-clock second; not measurable.
-   *  - $dKeyspace <= 0     : no forward progress (stall, or a checkpoint reset); nothing to learn.
+   * Rate = chunk length (base words) / wall-clock duration (solveTime - dispatchTime). This is the
+   * unit-correct, multiplier-agnostic sizing signal (chunk length and task keyspace are both in base
+   * words, unlike the raw hashcat hash-rate which is base-words/s x rules x salts), and it is measured
+   * over the WHOLE chunk rather than a single inter-report delta, so it reflects the stable sustained
+   * rate instead of the per-report jitter that made the old per-report reconcile oscillate.
+   *
+   * Returns null when there is nothing usable to measure (chunk too short, or no forward length).
    */
-  public static function observedChunkSpeed(int $newKeyspaceProgress, int $prevCheckpoint, int $prevSolveTime, int $now): ?int {
-    if ($prevSolveTime <= 0) { return null; }
-    $dT = $now - $prevSolveTime;
-    if ($dT < self::RECONCILE_MIN_INTERVAL) { return null; }
-    $dKeyspace = $newKeyspaceProgress - $prevCheckpoint;
-    if ($dKeyspace <= 0) { return null; }
-    return intval($dKeyspace / $dT);
+  public static function completedChunkSpeed(int $chunkLength, int $dispatchTime, int $solveTime): ?int {
+    if ($chunkLength <= 0) { return null; }
+    $duration = $solveTime - $dispatchTime;
+    if ($duration < self::RECONCILE_MIN_DURATION) { return null; }
+    return intval($chunkLength * self::SPEED_SCALE / $duration);
   }
 
+  /**
+   * Reconcile the stored (scaled) chunkSpeed toward a new observed (scaled) rate. Climb-only: the speed
+   * never decreases. That respects the long-standing maintainer rule against automatic chunk shrinking
+   * (hashtopolis/server#729) and, combined with the stable whole-chunk signal, removes the oscillation:
+   * a single upward jump is bounded to RECONCILE_MAX_UP_RATIO and the EWMA damps anomalous chunks.
+   */
   public static function reconcileSpeed(int $old, int $observed): int {
-    if ($observed <= self::RECONCILE_MIN_SPEED) { return $old; }
-    if ($old <= 0) { return $observed; }
-    $target = $observed;
-    if ($observed > $old) {                                   // upward only: bound the jump
-      $upper = (int) floor($old * self::RECONCILE_MAX_UP_RATIO);
-      if ($target > $upper) { $target = $upper; }
-    }
+    if ($observed <= 0) { return $old; }
+    if ($old <= 0) { return $observed; }      // first real measurement seeds directly
+    if ($observed <= $old) { return $old; }   // climb-only: never shrink
+    $upper = (int) floor($old * self::RECONCILE_MAX_UP_RATIO);
+    $target = ($observed > $upper) ? $upper : $observed;
     $blended = (1.0 - self::RECONCILE_ALPHA) * $old + self::RECONCILE_ALPHA * $target;
     return (int) max(1, round($blended));
   }
 
-  // Convert a stored benchmark value to a canonical chunk speed (H/s). Used to seed chunkSpeed from a
-  // benchmark submission and from manual benchmark overrides. Returns null on unparseable input.
+  // Convert a stored benchmark value to a canonical chunkSpeed (scaled by SPEED_SCALE). Used to seed
+  // chunkSpeed from a benchmark submission and from manual benchmark overrides. The scale is applied
+  // before flooring so a sub-unit seed (e.g. ~4/s on a slow hash) is not truncated away. Null on
+  // unparseable input.
   public static function benchmarkToChunkSpeed($benchmark, $keyspace): ?int {
     if ($benchmark === null || $benchmark === "") { return null; }
     if (strpos((string)$benchmark, ":") !== false) {
       $split = explode(":", (string)$benchmark);
       if (sizeof($split) != 2 || !is_numeric($split[0]) || !is_numeric($split[1]) || $split[0] <= 0 || $split[1] <= 0) { return null; }
-      return (int) floor($split[0] * 1000 / $split[1]);
+      // keyspace-per-ms -> base words/s, scaled: (split0 / split1) * 1000 * SPEED_SCALE
+      return (int) floor($split[0] * 1000 * self::SPEED_SCALE / $split[1]);
     }
     if (!is_numeric($benchmark) || $benchmark <= 0) { return null; }
     if ($keyspace === null || $keyspace <= 0) { return null; }
-    return (int) floor($benchmark * $keyspace / 100);
+    return (int) floor($benchmark * $keyspace * self::SPEED_SCALE / 100);
   }
 
   /**
@@ -234,7 +238,8 @@ class ChunkUtils {
     if ($chunkSpeed <= 0) {
       return ($keyspace > 0) ? $keyspace : 1;
     }
-    $size = floor($chunkSpeed * $chunkTime);
+    // chunkSpeed is scaled by SPEED_SCALE (milli-base-words/s); divide it back out here.
+    $size = floor($chunkSpeed * $chunkTime / self::SPEED_SCALE);
     $chunkSize = $size * $tolerance;
     if ($chunkSize <= 0) {
       $chunkSize = 1;
